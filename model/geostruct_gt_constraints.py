@@ -1,4 +1,3 @@
-# geostruct_gt_constraints.py
 """
 gDSA 图约束后处理模块 (v2 - 加入 MST 算法)
 
@@ -18,7 +17,6 @@ from collections import defaultdict
 from typing import List, Tuple, Dict, Optional
 
 
-# ============ Chu-Liu/Edmonds 最大生成树算法 ============
 
 class ChuLiuEdmonds:
     """
@@ -46,7 +44,6 @@ class ChuLiuEdmonds:
         if len(nodes) <= 1 or not edges:
             return []
         
-        # 如果没有指定根，尝试找最佳根
         if root is None:
             best_tree = []
             best_weight = -float('inf')
@@ -68,13 +65,11 @@ class ChuLiuEdmonds:
                  root: int) -> List[Tuple[int, int, float]]:
         """Edmonds 算法核心实现"""
         
-        # 构建邻接表：tgt -> [(src, weight), ...]
         incoming = defaultdict(list)
         for src, tgt, weight in edges:
             if tgt != root:  # 根节点不能有入边
                 incoming[tgt].append((src, weight))
         
-        # Step 1: 对每个非根节点，选择权重最大的入边
         max_in_edge = {}  # tgt -> (src, weight)
         for tgt in nodes:
             if tgt == root:
@@ -83,28 +78,21 @@ class ChuLiuEdmonds:
                 best_src, best_weight = max(incoming[tgt], key=lambda x: x[1])
                 max_in_edge[tgt] = (best_src, best_weight)
         
-        # 检查是否所有非根节点都有入边
         non_root_nodes = [n for n in nodes if n != root]
         if len(max_in_edge) < len(non_root_nodes):
-            # 有些节点无法到达，返回能构建的部分
             return [(src, tgt, w) for tgt, (src, w) in max_in_edge.items()]
         
-        # Step 2: 检测环
         cycle = ChuLiuEdmonds._find_cycle(max_in_edge, root)
         
         if cycle is None:
-            # 无环，直接返回
             return [(src, tgt, w) for tgt, (src, w) in max_in_edge.items()]
         
-        # Step 3: 收缩环
         cycle_set = set(cycle)
         new_node = max(nodes) + 1  # 新的超级节点
         
-        # 构建收缩后的图
         new_nodes = [n for n in nodes if n not in cycle_set] + [new_node]
         new_edges = []
         
-        # 记录边的来源，用于恢复
         edge_origin = {}  # (new_src, new_tgt) -> (orig_src, orig_tgt, orig_weight)
         
         for src, tgt, weight in edges:
@@ -112,41 +100,32 @@ class ChuLiuEdmonds:
                 continue  # 环内部的边忽略
             
             if tgt in cycle_set:
-                # 进入环的边：调整权重
-                # 新权重 = 原权重 - 环中该节点的最大入边权重
                 _, cycle_weight = max_in_edge[tgt]
                 new_weight = weight - cycle_weight
                 new_edges.append((src, new_node, new_weight))
                 edge_origin[(src, new_node)] = (src, tgt, weight)
             elif src in cycle_set:
-                # 离开环的边
                 new_edges.append((new_node, tgt, weight))
                 edge_origin[(new_node, tgt)] = (src, tgt, weight)
             else:
-                # 与环无关的边
                 new_edges.append((src, tgt, weight))
         
-        # 递归求解
         sub_tree = ChuLiuEdmonds._edmonds(new_nodes, new_edges, root)
         
-        # Step 4: 展开环
         result = []
         entering_node = None  # 进入环的节点
         
         for src, tgt, weight in sub_tree:
             if tgt == new_node:
-                # 找到进入环的边
                 orig_src, orig_tgt, orig_weight = edge_origin.get((src, new_node), (src, tgt, weight))
                 result.append((orig_src, orig_tgt, orig_weight))
                 entering_node = orig_tgt
             elif src == new_node:
-                # 离开环的边
                 orig_src, orig_tgt, orig_weight = edge_origin.get((new_node, tgt), (src, tgt, weight))
                 result.append((orig_src, orig_tgt, orig_weight))
             else:
                 result.append((src, tgt, weight))
         
-        # 添加环中的边（除了被替换的那条）
         for node in cycle:
             if node != entering_node and node in max_in_edge:
                 src, weight = max_in_edge[node]
@@ -166,7 +145,6 @@ class ChuLiuEdmonds:
             if node == root:
                 return None
             if node in path_set:
-                # 找到环
                 cycle_start = path.index(node)
                 return path[cycle_start:]
             if node in visited:
@@ -195,7 +173,6 @@ class ChuLiuEdmonds:
         return None
 
 
-# ============ 图约束求解器 ============
 
 class GraphConstraintSolver:
     """
@@ -206,7 +183,6 @@ class GraphConstraintSolver:
     - 空间关系增加 mutual exclusivity
     """
     
-    # 关系类型定义
     UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
     PARENT, CHILD, SEQUENCE, REFERENCE = 4, 5, 6, 7
     
@@ -244,16 +220,13 @@ class GraphConstraintSolver:
         if not pred_relations or num_nodes < 2:
             return []
         
-        # 按关系类型分组（不做阈值过滤，让约束算法处理所有边）
         relations_by_type = defaultdict(list)
         for src, tgt, rel_type, score in pred_relations:
-            # 只有当 score_threshold > 0 时才过滤
             if self.score_threshold <= 0 or score >= self.score_threshold:
                 relations_by_type[rel_type].append((src, tgt, score))
         
         legal_relations = []
         
-        # 1. 空间关系 (Up/Down/Left/Right)
         if self.apply_spatial:
             spatial_legal = self._process_spatial_relations(relations_by_type, num_nodes)
             legal_relations.extend(spatial_legal)
@@ -262,7 +235,6 @@ class GraphConstraintSolver:
                 for src, tgt, score in relations_by_type.get(rel_type, []):
                     legal_relations.append((src, tgt, rel_type, score))
         
-        # 2. Parent/Child 关系 - 使用 MST
         if self.apply_tree:
             tree_legal = self._process_tree_relations(relations_by_type, num_nodes)
             legal_relations.extend(tree_legal)
@@ -271,7 +243,6 @@ class GraphConstraintSolver:
                 for src, tgt, score in relations_by_type.get(rel_type, []):
                     legal_relations.append((src, tgt, rel_type, score))
         
-        # 3. Sequence 关系 - DAG 约束
         if self.apply_dag:
             seq_edges = relations_by_type.get(self.SEQUENCE, [])
             legal_seq = self._apply_dag_constraint(seq_edges, num_nodes)
@@ -281,7 +252,6 @@ class GraphConstraintSolver:
             for src, tgt, score in relations_by_type.get(self.SEQUENCE, []):
                 legal_relations.append((src, tgt, self.SEQUENCE, score))
         
-        # 4. Reference 关系 - 无特殊约束
         for src, tgt, score in relations_by_type.get(self.REFERENCE, []):
             legal_relations.append((src, tgt, self.REFERENCE, score))
         
@@ -291,7 +261,6 @@ class GraphConstraintSolver:
         """处理空间关系：反对称 + mutual exclusivity"""
         legal = []
         
-        # Up/Down 互斥
         up_edges = relations_by_type.get(self.UP, [])
         down_edges = relations_by_type.get(self.DOWN, [])
         legal_up, legal_down = self._apply_mutual_exclusivity(
@@ -302,7 +271,6 @@ class GraphConstraintSolver:
         for src, tgt, score in legal_down:
             legal.append((src, tgt, self.DOWN, score))
         
-        # Left/Right 互斥
         left_edges = relations_by_type.get(self.LEFT, [])
         right_edges = relations_by_type.get(self.RIGHT, [])
         legal_left, legal_right = self._apply_mutual_exclusivity(
@@ -323,7 +291,6 @@ class GraphConstraintSolver:
         - A(i,j) 和 B(i,j) 互斥（不能同时 Up 和 Down）
         - A(i,j) 和 A(j,i) 反对称
         """
-        # 使用字典代替矩阵，只存储非零值
         score_a = {}  # (src, tgt) -> score
         score_b = {}
         
@@ -337,7 +304,6 @@ class GraphConstraintSolver:
             if key not in score_b or score > score_b[key]:
                 score_b[key] = score
         
-        # 收集所有涉及的节点对
         all_pairs = set()
         for src, tgt in score_a:
             pair = (min(src, tgt), max(src, tgt))
@@ -349,7 +315,6 @@ class GraphConstraintSolver:
         legal_a, legal_b = [], []
         
         for i, j in all_pairs:
-            # 收集所有相关分数
             candidates = []
             if (i, j) in score_a:
                 candidates.append((score_a[(i, j)], 'A', i, j))
@@ -388,13 +353,8 @@ class GraphConstraintSolver:
         parent_edges = relations_by_type.get(self.PARENT, [])
         child_edges = relations_by_type.get(self.CHILD, [])
         
-        # 分别处理 Parent 和 Child，但共享树约束
-        # 构建统一的 "父子关系" 图：src 是 tgt 的父节点
         
-        # Parent(src, tgt): src 是 tgt 的父 → tgt 的入边
-        # Child(src, tgt): src 是 tgt 的父 → tgt 的入边
         
-        # 合并所有边，记录原始类型
         all_edges = []  # (src, tgt, score, rel_type)
         
         for src, tgt, score in parent_edges:
@@ -409,8 +369,6 @@ class GraphConstraintSolver:
         nodes = list(range(num_nodes))
         
         if self.use_mst:
-            # 使用 MST，但需要保留原始类型
-            # 先用 MST 确定哪些 (src, tgt) 对被选中
             edges_for_mst = [(src, tgt, score) for src, tgt, score, _ in all_edges]
             
             virtual_root = num_nodes
@@ -424,13 +382,11 @@ class GraphConstraintSolver:
                 root=virtual_root
             )
             
-            # 找出被选中的 (src, tgt) 对
             selected_pairs = set()
             for src, tgt, score in mst_edges:
                 if src != virtual_root and score > 0:
                     selected_pairs.add((src, tgt))
             
-            # 对于每个选中的对，找原始类型中分数最高的
             for src, tgt in selected_pairs:
                 best_score = 0
                 best_type = self.PARENT
@@ -440,14 +396,10 @@ class GraphConstraintSolver:
                         best_type = rel_type
                 legal.append((src, tgt, best_type, best_score))
         else:
-            # 贪心：分别处理 Parent 和 Child
-            # Parent: 每个 tgt 最多一个入边
             legal_parent = self._greedy_single_parent(parent_edges, num_nodes)
             for src, tgt, score in legal_parent:
                 legal.append((src, tgt, self.PARENT, score))
             
-            # Child: 每个 tgt 最多一个入边（与 Parent 共享约束）
-            # 需要排除已经有 Parent 的节点
             has_parent = set(tgt for _, tgt, _ in legal_parent)
             filtered_child = [(s, t, sc) for s, t, sc in child_edges if t not in has_parent]
             legal_child = self._greedy_single_parent(filtered_child, num_nodes)
@@ -468,7 +420,6 @@ class GraphConstraintSolver:
         
         for src, tgt, score in sorted_edges:
             if tgt not in has_parent:
-                # 检查是否会形成环
                 if not self._can_reach(adj, tgt, src):
                     legal.append((src, tgt, score))
                     has_parent.add(tgt)
@@ -487,12 +438,10 @@ class GraphConstraintSolver:
         
         sorted_edges = sorted(seq_edges, key=lambda x: -x[2])
         
-        # 使用邻接表和可达性缓存
         adj = defaultdict(set)
         legal = []
         
         for src, tgt, score in sorted_edges:
-            # 快速检查：tgt 能否到达 src
             if not self._can_reach(adj, tgt, src):
                 legal.append((src, tgt, score))
                 adj[src].add(tgt)
@@ -519,7 +468,6 @@ class GraphConstraintSolver:
         
         return False
     
-# ============ 便捷函数 ============
 
 def apply_graph_constraints(pred_relations, num_nodes, 
                            apply_spatial=True, 
@@ -572,36 +520,29 @@ def apply_graph_constraints_numpy(src_arr, tgt_arr, rel_arr, scores_arr, num_nod
         return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
                 np.array([], dtype=np.int64), np.array([], dtype=np.float32))
     
-    # 关系类型常量
     UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
     PARENT, CHILD, SEQUENCE, REFERENCE = 4, 5, 6, 7
     
     legal_mask = np.ones(len(src_arr), dtype=bool)
     
-    # 1. 空间关系约束（Up/Down, Left/Right 互斥 + 反对称）
     if apply_spatial:
-        # Up/Down 互斥
         legal_mask &= _apply_spatial_constraint_numpy(
             src_arr, tgt_arr, rel_arr, scores_arr, UP, DOWN, legal_mask
         )
-        # Left/Right 互斥
         legal_mask &= _apply_spatial_constraint_numpy(
             src_arr, tgt_arr, rel_arr, scores_arr, LEFT, RIGHT, legal_mask
         )
     
-    # 2. Parent/Child 树约束（每个节点最多一个 Parent）
     if apply_tree:
         legal_mask &= _apply_tree_constraint_numpy(
             src_arr, tgt_arr, rel_arr, scores_arr, PARENT, CHILD, num_nodes, legal_mask
         )
     
-    # 3. Sequence DAG 约束（无环）
     if apply_dag:
         legal_mask &= _apply_dag_constraint_numpy(
             src_arr, tgt_arr, rel_arr, scores_arr, SEQUENCE, legal_mask
         )
     
-    # 返回合法的边
     return (src_arr[legal_mask].astype(np.int64),
             tgt_arr[legal_mask].astype(np.int64),
             rel_arr[legal_mask].astype(np.int64),
@@ -617,15 +558,12 @@ def _apply_spatial_constraint_numpy(src, tgt, rel, scores, rel_a, rel_b, mask):
     """
     new_mask = mask.copy()
     
-    # 找出所有 rel_a 和 rel_b 的边
     is_a = (rel == rel_a) & mask
     is_b = (rel == rel_b) & mask
     
     if not (is_a.any() or is_b.any()):
         return new_mask
     
-    # 构建节点对到最高分的映射
-    # 对于每个无序节点对 (min(i,j), max(i,j))，找出最高分的边
     pair_best = {}  # (i, j) -> (score, index, rel_type)
     
     for idx in np.where(is_a | is_b)[0]:
@@ -635,7 +573,6 @@ def _apply_spatial_constraint_numpy(src, tgt, rel, scores, rel_a, rel_b, mask):
         if pair not in pair_best or sc > pair_best[pair][0]:
             pair_best[pair] = (sc, idx, r, s, t)
     
-    # 标记非最优的边
     for idx in np.where(is_a | is_b)[0]:
         s, t = src[idx], tgt[idx]
         pair = (min(s, t), max(s, t))
@@ -653,17 +590,14 @@ def _apply_tree_constraint_numpy(src, tgt, rel, scores, parent_rel, child_rel, n
     """
     new_mask = mask.copy()
     
-    # 找出所有 Parent 和 Child 边
     is_tree = ((rel == parent_rel) | (rel == child_rel)) & mask
     
     if not is_tree.any():
         return new_mask
     
-    # 按分数降序排序
     tree_indices = np.where(is_tree)[0]
     sorted_idx = tree_indices[np.argsort(-scores[tree_indices])]
     
-    # 贪心：每个 tgt 只保留第一个
     has_parent = set()
     
     for idx in sorted_idx:
@@ -683,17 +617,14 @@ def _apply_dag_constraint_numpy(src, tgt, rel, scores, seq_rel, mask):
     """
     new_mask = mask.copy()
     
-    # 找出所有 Sequence 边
     is_seq = (rel == seq_rel) & mask
     
     if not is_seq.any():
         return new_mask
     
-    # 按分数降序排序
     seq_indices = np.where(is_seq)[0]
     sorted_idx = seq_indices[np.argsort(-scores[seq_indices])]
     
-    # 贪心 + 环检测
     from collections import deque
     adj = defaultdict(set)
     
