@@ -8,11 +8,11 @@ A method for fine-grained document structure analysis that improves the parsing 
 
 **Model Architecture**
 
-![Model Diagram](<./GeoStruct-GT 模型结构图片 (1).png>)
+![Model Diagram](<GeoStruct-GT 模型结构图片 (1).png>)
 
 **Dataset Example**
 
-![Dataset Example](./label_list.png)
+![Dataset Example](label_list.png)
 
 ## Files
 
