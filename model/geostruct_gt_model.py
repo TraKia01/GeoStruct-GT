@@ -1,13 +1,4 @@
-# geostruct_gt_model.py - 精简版：只保留实际使用的模块
-"""
-纯视觉版本的 YOLO + Graph Transformer gDSA 模型
-用于 geostruct_gt_train.py
-
-特点：
-- 节点特征：只有视觉特征（无节点几何特征）
-- 边特征：保留边几何特征
-- 支持多种 backbone（YOLO11, ResNet50, ConvNeXt 等）
-"""
+"""Model for GeoStruct-GT."""
 
 import torch
 import torch.nn as nn
@@ -18,17 +9,15 @@ import torchvision.ops as ops
 import math
 
 
-# ============ 特征提取器 ============
 
 class YOLONeckFeatureExtractor(nn.Module):
-    """从 YOLO 模型中提取 Neck 输出的特征（已融合的多尺度特征）"""
+    """YOLO neck feature extractor."""
     
     def __init__(self, yolo_model, freeze=False):
         super().__init__()
         
         self.__dict__['_yolo_model'] = yolo_model
         
-        # 找到 Detect 层及其输入层索引
         from ultralytics.nn.modules.head import Detect
         
         self.detect_layer_idx = None
@@ -80,7 +69,6 @@ class YOLONeckFeatureExtractor(nn.Module):
         y = []
         
         for i, m in enumerate(self._yolo_model.model):
-            # 处理输入来源
             if m.f != -1:
                 if isinstance(m.f, int):
                     x = y[m.f] if m.f < len(y) else x
@@ -93,7 +81,6 @@ class YOLONeckFeatureExtractor(nn.Module):
             if isinstance(m, Detect):
                 break
         
-        # 收集 Neck 输出的特征
         neck_features = []
         for idx in self.neck_feature_indices:
             if idx < len(y):
@@ -213,10 +200,9 @@ class EdgeGeometricExtractor(nn.Module):
         return self.mlp(edge_features)
 
 
-# ============ Graph Transformer ============
 
 class GraphTransformerLayer(nn.Module):
-    """Graph Transformer Layer"""
+    """Graph transformer layer."""
     
     def __init__(self, hidden_dim, num_heads=8, edge_dim=64, dropout=0.1, use_edge_bias=True):
         super().__init__()
@@ -232,7 +218,6 @@ class GraphTransformerLayer(nn.Module):
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         
-        # 只在使用边特征时创建投影层
         if use_edge_bias:
             self.edge_proj = nn.Linear(edge_dim, num_heads)
         else:
@@ -271,7 +256,6 @@ class GraphTransformerLayer(nn.Module):
             adj_mask[edge_index[0], edge_index[1]] = True
             adj_mask.fill_diagonal_(True)
             
-            # 只在启用边特征时添加注意力偏置
             if self.use_edge_bias and self.edge_proj is not None and edge_attr is not None:
                 edge_bias = self.edge_proj(edge_attr)
                 attn_bias = torch.zeros(N, N, self.num_heads, device=x.device)
@@ -297,7 +281,7 @@ class GraphTransformerLayer(nn.Module):
 
 
 class GraphTransformer(nn.Module):
-    """Graph Transformer for relation prediction"""
+    """Relation transformer."""
     
     def __init__(self, 
                  node_dim,
@@ -329,7 +313,6 @@ class GraphTransformer(nn.Module):
         
         self.layer_weights = nn.Parameter(torch.ones(num_layers + 1))
         
-        # 根据是否使用边特征调整输入维度
         classifier_input_dim = hidden_dim * 2 + (edge_dim if use_edge_features else 0)
         
         self.edge_classifier = nn.Sequential(
@@ -376,7 +359,6 @@ class GraphTransformer(nn.Module):
         src_feat = x[src_idx]
         tgt_feat = x[tgt_idx]
         
-        # 根据配置决定是否使用边特征
         if self.use_edge_features and edge_attr is not None:
             edge_repr = torch.cat([src_feat, tgt_feat, edge_attr], dim=1)
         else:
@@ -388,7 +370,6 @@ class GraphTransformer(nn.Module):
         return relation_logits, exist_logits
 
 
-# ============ 主模型 ============
 
 class YOLOgDSATransformerVisualOnly(nn.Module):
     """
@@ -419,7 +400,6 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
         self.use_neck_features = use_neck_features
         self.use_edge_features = use_edge_features  # 保存配置
         
-        # 1. YOLO 模型
         yolo = YOLO(yolo_model_path)
         
         if isinstance(yolo_model_path, str) and yolo_model_path.lower().endswith(('.yaml', '.yml')):
@@ -454,7 +434,6 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
             else:
                 print(f"✅ 加载 YOLO 预训练权重: {yolo_model_path}, nc={num_classes}")
         
-        # 确保 args 是 SimpleNamespace
         from types import SimpleNamespace
         from ultralytics.cfg import DEFAULT_CFG_DICT
         if not hasattr(yolo.model, 'args') or isinstance(yolo.model.args, dict):
@@ -464,16 +443,13 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
         yolo.model = self.det_model
         self.__dict__['_yolo'] = yolo
         
-        # 2. 特征提取器
         self.feature_extractor = YOLONeckFeatureExtractor(self.det_model, freeze=False)
         self.backbone_extractor = self.feature_extractor
         print(f"✅ 使用 Neck 特征（已融合的多尺度特征）")
         
-        # 3. RoI 特征提取
         self.roi_extractor = RoIFeatureExtractor(output_dim=visual_feature_dim)
         print(f"✅ 使用单尺度 RoI 特征提取 (dim={visual_feature_dim})")
         
-        # 4. 边几何特征提取
         if use_edge_features:
             self.edge_geometric_extractor = EdgeGeometricExtractor(output_dim=edge_geometric_dim)
             print(f"✅ 使用边几何特征 (dim={edge_geometric_dim})")
@@ -481,7 +457,6 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
             self.edge_geometric_extractor = None
             print(f"⚠️ 不使用边几何特征（对照实验）")
         
-        # 5. Graph Transformer
         self.graph_transformer = GraphTransformer(
             node_dim=visual_feature_dim,
             hidden_dim=transformer_hidden_dim,
@@ -541,24 +516,19 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
         
         N = len(boxes)
         
-        # 构建全连接图
         if edge_index is None:
             src = torch.arange(N, device=device).repeat_interleave(N)
             tgt = torch.arange(N, device=device).repeat(N)
             mask = src != tgt
             edge_index = torch.stack([src[mask], tgt[mask]], dim=0)
         
-        # 提取节点特征（纯视觉）
         node_features = self.roi_extractor(features, boxes)
         
-        # 提取边特征（如果启用）
         if self.use_edge_features and self.edge_geometric_extractor is not None:
             edge_geometric_features = self.edge_geometric_extractor(boxes, edge_index)
         else:
-            # 不使用边特征时，传入 None 或零张量
             edge_geometric_features = None
         
-        # Graph Transformer
         relation_logits, exist_logits = self.graph_transformer(
             node_features, edge_index, edge_geometric_features
         )
@@ -621,7 +591,6 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
             from ultralytics.utils.nms import non_max_suppression
         device = images.device
         
-        # 一次前向传播，保存原始预测
         was_training = self.det_model.training
         self.det_model.eval()
         with torch.no_grad():
@@ -629,7 +598,6 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
         if was_training:
             self.det_model.train()
         
-        # NMS 获取检测框
         results = non_max_suppression(
             raw_preds, conf_thres=conf_thresh, iou_thres=0.45,
             classes=None, max_det=300, nc=self.num_classes
@@ -683,6 +651,5 @@ class YOLOgDSATransformerVisualOnly(nn.Module):
         return self._yolo
 
 
-# ============ 向后兼容别名 ============
-# 为了兼容旧代码，提供别名
 YOLOgDSATransformerModel = YOLOgDSATransformerVisualOnly
+

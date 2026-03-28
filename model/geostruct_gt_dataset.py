@@ -1,8 +1,4 @@
-# geostruct_gt_dataset.py - 基于YOLO的GeoStruct-GT数据集
-"""
-为YOLOgDSA模型准备数据
-支持端到端训练
-"""
+"""Dataset for GeoStruct-GT."""
 
 import os
 import json
@@ -14,15 +10,7 @@ from pathlib import Path
 
 
 class YOLOgDSADataset(Dataset):
-    """
-    YOLO + gDSA 联合数据集
-    
-    数据格式:
-    - 图片: *.jpg
-    - YOLO标注: *.txt (class_id cx cy w h)
-    - 空间关系: *.json
-    - 逻辑关系: *.json
-    """
+    """Dataset loader."""
     
     def __init__(self,
                  img_dir,
@@ -50,7 +38,6 @@ class YOLOgDSADataset(Dataset):
         self.use_original_size = use_original_size  # 是否使用原始图片大小
         self.max_size = max_size if max_size > 0 else 99999  # 原始尺寸模式下的最大边长限制
         
-        # 加载类别
         if classes_file and os.path.exists(classes_file):
             with open(classes_file, 'r', encoding='utf-8') as f:
                 self.classes = [line.strip() for line in f.readlines()]
@@ -60,7 +47,6 @@ class YOLOgDSADataset(Dataset):
         
         self.num_classes = len(self.classes)
         
-        # 关系类型定义
         self.spatial_rel_types = {
             0: 'up',
             1: 'down',
@@ -75,7 +61,6 @@ class YOLOgDSADataset(Dataset):
             7: 'reference'
         }
         
-        # 获取所有图片文件
         self.img_files = self._get_image_files()
         
         print(f"📊 加载 {mode} 数据集: {len(self.img_files)} 张图片")
@@ -95,14 +80,11 @@ class YOLOgDSADataset(Dataset):
         ratio = min(new_size / h, new_size / w)
         new_w, new_h = int(w * ratio), int(h * ratio)
         
-        # Resize
         img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         
-        # Padding
         pad_w = (new_size - new_w) // 2
         pad_h = (new_size - new_h) // 2
         
-        # 创建灰色背景 (114 是 YOLO 默认值)
         img_padded = np.full((new_size, new_size, 3), 114, dtype=np.uint8)
         img_padded[pad_h:pad_h+new_h, pad_w:pad_w+new_w] = img_resized
         
@@ -141,29 +123,23 @@ class YOLOgDSADataset(Dataset):
         img_path = os.path.join(self.img_dir, img_name)
         img_id = Path(img_name).stem
         
-        # 1. 读取图像
         image = cv2.imread(img_path)
         if image is None:
             raise ValueError(f"无法读取图像: {img_path}")
         
         orig_h, orig_w = image.shape[:2]
         
-        # 转换为RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         if self.use_original_size:
-            # 使用原始尺寸模式：保持宽高比，但限制最大边长
-            # 这样 GT boxes 的归一化坐标可以直接使用，不需要转换
             max_side = max(orig_h, orig_w)
             if max_side > self.max_size:
-                # 等比例缩放到 max_size
                 scale = self.max_size / max_side
                 new_h = int(orig_h * scale)
                 new_w = int(orig_w * scale)
             else:
                 new_h, new_w = orig_h, orig_w
             
-            # 调整为 32 的倍数（YOLO 要求）
             new_h = ((new_h + 31) // 32) * 32
             new_w = ((new_w + 31) // 32) * 32
             
@@ -171,16 +147,13 @@ class YOLOgDSADataset(Dataset):
                 image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         else:
-            # Letterbox resize（保持比例，和 YOLO 官方一致）
             image_resized, ratio, (pad_w, pad_h) = self._letterbox(image, self.img_size)
             image_tensor = torch.from_numpy(image_resized).permute(2, 0, 1).float() / 255.0
         
-        # 2. 读取YOLO标注（原图归一化坐标）
         yolo_path = os.path.join(self.yolo_dir, f"{img_id}.txt")
         boxes, classes, yolo_boxes = self._load_yolo_annotations(yolo_path)
         
         if len(boxes) == 0:
-            # 没有标注，返回空样本
             return {
                 'image': image_tensor,
                 'boxes': torch.zeros(0, 4),
@@ -192,7 +165,6 @@ class YOLOgDSADataset(Dataset):
                 'img_size': (orig_h, orig_w)
             }
         
-        # 3. 读取关系标注
         edge_index, edge_labels = self._load_relations(img_id, len(boxes))
         
         return {
@@ -231,7 +203,6 @@ class YOLOgDSADataset(Dataset):
 
                     yolo_boxes.append([cx, cy, w, h])
                     
-                    # 转换为 (x1, y1, x2, y2)
                     x1 = cx - w / 2
                     y1 = cy - h / 2
                     x2 = cx + w / 2
@@ -259,10 +230,8 @@ class YOLOgDSADataset(Dataset):
         """
         num_relations = len(self.spatial_rel_types) + len(self.logic_rel_types)
 
-        # 先构建一个 (src, tgt) -> K 维向量 的字典，只包含有标注的边
         rel_dict = {}
 
-        # 加载空间关系
         if self.use_spatial and self.spatial_rel_dir:
             spatial_path = os.path.join(self.spatial_rel_dir, f"{img_id}.json")
             if os.path.exists(spatial_path):
@@ -279,7 +248,6 @@ class YOLOgDSADataset(Dataset):
                                 rel_dict[key] = [0] * num_relations
                             rel_dict[key][rel_id] = 1
 
-        # 加载逻辑关系
         if self.use_logic and self.logic_rel_dir:
             logic_path = os.path.join(self.logic_rel_dir, f"{img_id}.json")
             if os.path.exists(logic_path):
@@ -296,7 +264,6 @@ class YOLOgDSADataset(Dataset):
                                 rel_dict[key] = [0] * num_relations
                             rel_dict[key][rel_id] = 1
 
-        # 如果使用全连接图模式：为所有 src!=tgt 构建一条边，没有标注的边 label 全 0
         if self.use_full_graph and num_nodes > 0:
             all_edges = []
             all_labels = []
@@ -319,7 +286,6 @@ class YOLOgDSADataset(Dataset):
             edge_labels = torch.tensor(all_labels, dtype=torch.float32)  # [E, K]
             return edge_index, edge_labels
 
-        # 原始模式：只返回有标注的边
         if len(rel_dict) == 0:
             return (
                 torch.zeros(2, 0, dtype=torch.long),
@@ -345,8 +311,8 @@ def collate_fn(batch):
     注意：这里假设batch_size=1（每次处理一张图）
     如果需要batch>1，需要更复杂的处理
     """
-    # 由于每张图的节点数和边数不同，暂时只支持batch_size=1
     if len(batch) > 1:
         raise NotImplementedError("当前只支持batch_size=1")
     
     return batch[0]
+

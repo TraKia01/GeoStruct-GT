@@ -1,18 +1,4 @@
-# geostruct_gt_train.py
-"""
-带图约束 Loss 的 gDSA 训练脚本
-
-在原有 Loss 基础上增加结构约束惩罚：
-1. 反对称约束 Loss: 惩罚 Up(A,B) 和 Up(B,A) 同时为高分
-2. 树约束 Loss: 惩罚一个节点有多个 Parent
-3. DAG 约束 Loss: 惩罚 Sequence 中的环
-
-使用方法:
-    python geostruct_gt_train.py \
-        --yolo yolo11n.pt \
-        --epochs 100 \
-        --constraint-weight 0.1
-"""
+"""Training for GeoStruct-GT."""
 
 import os
 import json
@@ -32,10 +18,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from geostruct_gt_dataset import YOLOgDSADataset
 from geostruct_gt_model import YOLOgDSATransformerVisualOnly
-from geostruct_gt_evaluator import gDSAEvaluator as gDSAEvaluatorNew
+from geostruct_gt_evaluator import gDSAEvaluator
 
 
-# Backbone 映射
 BACKBONE_MAP = {
     'yolo11n': 'yolo11n.pt',
     'yolo11s': 'yolo11s.pt',
@@ -50,19 +35,10 @@ BACKBONE_MAP = {
 }
 
 
-# ============ 约束 Loss 模块 ============
 
 class ConstraintLoss(nn.Module):
-    """
-    图结构约束 Loss（向量化版本，GPU 加速）
+    """Constraint loss."""
     
-    惩罚违反文档关系图约束的预测：
-    1. 反对称约束: Up/Down, Left/Right 不能同时存在于 (i,j) 和 (j,i)
-    2. 单父约束: 每个节点最多一个 Parent
-    3. DAG 约束: Sequence 关系不能形成 2-环
-    """
-    
-    # 关系类型
     UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
     PARENT, CHILD, SEQUENCE, REFERENCE = 4, 5, 6, 7
     
@@ -76,16 +52,7 @@ class ConstraintLoss(nn.Module):
         self.dag_weight = dag_weight
     
     def forward(self, rel_probs, edge_index, num_nodes):
-        """
-        Args:
-            rel_probs: [E, num_relations] 关系概率 (sigmoid 后)
-            edge_index: [2, E] 边索引
-            num_nodes: 节点数量
-            
-        Returns:
-            constraint_loss: 约束违反惩罚
-            loss_dict: 各项 loss 的字典
-        """
+        """Forward pass."""
         E = rel_probs.size(0)
         device = rel_probs.device
         
@@ -95,20 +62,16 @@ class ConstraintLoss(nn.Module):
         loss_dict = {}
         total_loss = torch.tensor(0.0, device=device)
         
-        # 预计算反向边映射（向量化）
         reverse_idx = self._compute_reverse_edge_idx(edge_index, num_nodes)
         
-        # 1. 反对称约束 Loss（向量化）
         antisym_loss = self._antisymmetric_loss_vectorized(rel_probs, reverse_idx)
         loss_dict['antisym'] = antisym_loss.item()
         total_loss = total_loss + self.antisym_weight * antisym_loss
         
-        # 2. 单父约束 Loss（已经是向量化的）
         tree_loss = self._tree_constraint_loss(rel_probs, edge_index, num_nodes)
         loss_dict['tree'] = tree_loss.item()
         total_loss = total_loss + self.tree_weight * tree_loss
         
-        # 3. DAG 约束 Loss（向量化）
         if self.dag_weight > 0:
             dag_loss = self._dag_constraint_loss_vectorized(rel_probs, reverse_idx)
             loss_dict['dag'] = dag_loss.item()
@@ -126,19 +89,15 @@ class ConstraintLoss(nn.Module):
         E = edge_index.size(1)
         device = edge_index.device
         
-        # 用 (src * num_nodes + tgt) 作为边的唯一 ID
         src, tgt = edge_index[0], edge_index[1]
         edge_ids = src * num_nodes + tgt  # [E]
         reverse_edge_ids = tgt * num_nodes + src  # [E]
         
-        # 构建 edge_id -> edge_idx 的映射
-        # 使用 scatter 构建稀疏映射
         max_id = num_nodes * num_nodes
         id_to_idx = torch.full((max_id,), -1, dtype=torch.long, device=device)
         edge_indices = torch.arange(E, device=device)
         id_to_idx.scatter_(0, edge_ids, edge_indices)
         
-        # 查找每条边的反向边
         reverse_idx = id_to_idx[reverse_edge_ids]  # [E]
         
         return reverse_idx
@@ -152,27 +111,21 @@ class ConstraintLoss(nn.Module):
         device = rel_probs.device
         E = rel_probs.size(0)
         
-        # 找出有反向边的边
         has_reverse = reverse_idx >= 0  # [E]
         
         if not has_reverse.any():
             return torch.tensor(0.0, device=device)
         
-        # 获取有反向边的边的索引和对应的反向边索引
         valid_idx = torch.where(has_reverse)[0]  # [K]
         valid_reverse_idx = reverse_idx[valid_idx]  # [K]
         
-        # 反对称关系: Up, Down, Left, Right
         antisym_rels = [self.UP, self.DOWN, self.LEFT, self.RIGHT]
         
-        # 取出这些关系的概率 [K, 4]
         forward_probs = rel_probs[valid_idx][:, antisym_rels]
         reverse_probs = rel_probs[valid_reverse_idx][:, antisym_rels]
         
-        # 惩罚: P(r|i,j) * P(r|j,i)
         loss = (forward_probs * reverse_probs).sum()
         
-        # 归一化
         count = valid_idx.size(0) * len(antisym_rels)
         return loss / max(count, 1)
     
@@ -207,17 +160,14 @@ class ConstraintLoss(nn.Module):
         valid_idx = torch.where(has_reverse)[0]
         valid_reverse_idx = reverse_idx[valid_idx]
         
-        # Sequence 关系的概率
         forward_seq = rel_probs[valid_idx, self.SEQUENCE]
         reverse_seq = rel_probs[valid_reverse_idx, self.SEQUENCE]
         
-        # 惩罚双向都有高概率
         loss = (forward_seq * reverse_seq).sum()
         
         return loss / max(valid_idx.size(0), 1)
 
 
-# ============ 关系预测 Loss ============
 
 class RelationLossWithConstraints(nn.Module):
     """
@@ -244,7 +194,6 @@ class RelationLossWithConstraints(nn.Module):
         self.hard_neg_ratio = hard_neg_ratio
         self.constraint_mode = constraint_mode
         
-        # 根据 constraint_mode 设置约束权重
         if constraint_mode == 'full':
             antisym_weight = 1.0
             tree_weight = 1.0
@@ -258,7 +207,6 @@ class RelationLossWithConstraints(nn.Module):
             tree_weight = 0.0
             dag_weight = 0.0
         
-        # 约束 Loss
         self.constraint_loss = ConstraintLoss(
             antisym_weight=antisym_weight,
             tree_weight=tree_weight,
@@ -285,16 +233,13 @@ class RelationLossWithConstraints(nn.Module):
                 'rel_loss': 0.0, 'exist_loss': 0.0, 'constraint_loss': 0.0
             }
         
-        # 1. 关系分类 Loss
         has_relation = edge_labels.any(dim=1)  # [E]
         pos_mask = has_relation
         
         if pos_mask.sum() > 0:
-            # 正样本的关系分类
             pos_logits = relation_logits[pos_mask]
             pos_labels = edge_labels[pos_mask].float()
             
-            # 分空间和逻辑关系加权
             spatial_loss = F.binary_cross_entropy_with_logits(
                 pos_logits[:, :4], pos_labels[:, :4], reduction='mean'
             )
@@ -305,7 +250,6 @@ class RelationLossWithConstraints(nn.Module):
         else:
             rel_loss = torch.tensor(0.0, device=device)
         
-        # 2. 边存在性 Loss (Hard Negative Mining)
         exist_labels = has_relation.float()
         
         num_pos = pos_mask.sum().item()
@@ -334,7 +278,6 @@ class RelationLossWithConstraints(nn.Module):
                 exist_logits, exist_labels, reduction='mean'
             )
         
-        # 3. 约束 Loss
         constraint_loss_val = torch.tensor(0.0, device=device)
         constraint_dict = {}
         
@@ -344,7 +287,6 @@ class RelationLossWithConstraints(nn.Module):
                 rel_probs, edge_index, num_nodes
             )
         
-        # 总 Loss
         total_loss = (rel_loss + 
                       self.exist_weight * exist_loss + 
                       self.constraint_weight * constraint_loss_val)
@@ -359,7 +301,6 @@ class RelationLossWithConstraints(nn.Module):
         return total_loss, loss_dict
 
 
-# ============ 训练器 ============
 
 class ConstraintTrainer:
     """带约束 Loss 的训练器"""
@@ -385,14 +326,12 @@ class ConstraintTrainer:
         edge_status = "有边特征" if config.get('use_edge_features', True) else "无边特征"
         print(f"✅ 使用 Transformer 模型 ({edge_status})")
         
-        # 解冻 YOLO 和 Backbone（允许端到端训练）
         self.model.unfreeze_yolo()
         if hasattr(self.model, 'backbone_extractor'):
             self.model.backbone_extractor.unfreeze_backbone()
         elif hasattr(self.model, 'feature_extractor'):
             self.model.feature_extractor.unfreeze_backbone()
         
-        # Loss - 根据 constraint_mode 配置约束
         self.relation_loss = RelationLossWithConstraints(
             spatial_weight=1.0,
             logic_weight=1.5,
@@ -402,10 +341,8 @@ class ConstraintTrainer:
             constraint_mode=config['constraint_mode']
         )
         
-        # 保存约束模式用于验证
         self.constraint_mode = config['constraint_mode']
         
-        # 数据集
         self.train_dataset = YOLOgDSADataset(
             img_dir=config['train_img_dir'],
             yolo_dir=config['train_yolo_dir'],
@@ -441,7 +378,6 @@ class ConstraintTrainer:
         
         print(f"📊 训练集: {len(self.train_dataset)}, 验证集: {len(self.val_dataset)}")
         
-        # 优化器
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config['lr'],
@@ -452,7 +388,6 @@ class ConstraintTrainer:
             self.optimizer, T_max=config['epochs'], eta_min=1e-6
         )
         
-        # 训练状态
         self.current_epoch = 0
         self.best_metrics = {}
         self.best_metrics_05 = {}  # mAP@0.5 最佳
@@ -460,7 +395,6 @@ class ConstraintTrainer:
         self.best_metrics_095 = {}  # mAP@0.95 最佳
         self.history = defaultdict(list)
         
-        # 早停（监控三个 mAP 指标）
         self.early_stop_patience = config.get('early_stop_patience', 0)  # 0 表示不启用
         self.early_stop_counter = 0
         self.best_early_stop_metrics = {
@@ -469,11 +403,9 @@ class ConstraintTrainer:
             'mAP_g@0.95': 0.0
         }
         
-        # 时间统计
         self.train_start_time = None
         self.total_train_time = 0.0
         
-        # 保存目录
         os.makedirs(config['save_dir'], exist_ok=True)
 
     
@@ -485,7 +417,6 @@ class ConstraintTrainer:
         loss_components = defaultdict(float)
         num_batches = 0
         
-        # pred 模式统计
         pred_mode_stats = {
             'total_samples': 0,
             'valid_samples': 0,  # 有足够匹配的样本
@@ -513,17 +444,11 @@ class ConstraintTrainer:
             if rel_train_mode == 'pred':
                 pred_mode_stats['total_samples'] += 1
                 
-                # ====== pred 模式：用检测框训练关系（优化：尝试复用前向传播）======
-                # 早期训练降低置信度阈值，让检测器输出更多框
                 conf_thresh = 0.01 if epoch <= 10 else 0.05 if epoch <= 50 else 0.25
                 
-                # 🔥 优化方案3尝试：使用 detect_and_get_raw_preds 获取检测框和原始预测
-                # 注意：YOLO loss 计算需要训练模式的前向传播，无法完全复用 eval 模式的预测
-                # 因此这里仍然会有两次前向传播，但第一次更快（no_grad + eval）
                 if hasattr(self.model, 'detect_and_get_raw_preds'):
                     pred_boxes, pred_classes, _, raw_preds = self.model.detect_and_get_raw_preds(images, conf_thresh=conf_thresh)
                 else:
-                    # 回退到原始方法
                     det_model = getattr(self.model, 'det_model', None)
                     if det_model is not None:
                         was_training = det_model.training
@@ -538,14 +463,12 @@ class ConstraintTrainer:
                 
                 pred_mode_stats['total_pred_boxes'] += len(pred_boxes)
 
-                # IoU+类别 matching: {gt_idx: pred_idx}
                 matching = self._instance_matching_drgg_style(
                     pred_boxes, pred_classes, gt_boxes, gt_classes, iou_thresh=0.5
                 )
                 
                 pred_mode_stats['total_matched'] += len(matching)
 
-                # 只在匹配到的 pred 节点子图上训练（类似 DRGG：matched queries）
                 if len(matching) >= 2:
                     pred_mode_stats['valid_samples'] += 1
                     matched_gt_indices = sorted(matching.keys())
@@ -557,25 +480,21 @@ class ConstraintTrainer:
                     classes = pred_classes[matched_pred_indices]
                     M = len(boxes)
 
-                    # 构建全连接图 (M nodes)
                     src = torch.arange(M, device=self.device).repeat_interleave(M)
                     tgt = torch.arange(M, device=self.device).repeat(M)
                     mask = src != tgt
                     pred_edge_index = torch.stack([src[mask], tgt[mask]], dim=0)
 
-                    # 构建 GT dense 关系矩阵 [N_gt, N_gt, R]
                     R = self.config['num_relations']
                     gt_rel_dense = torch.zeros(len(gt_boxes), len(gt_boxes), R, device=self.device)
                     if gt_edge_index.numel() > 0 and gt_edge_labels.numel() > 0:
                         gt_rel_dense[gt_edge_index[0], gt_edge_index[1]] = gt_edge_labels.float()
 
-                    # 将 pred 子图边映射到 gt 子图边，生成 pred_edge_labels
                     gt_idx_per_pred = matched_gt_indices  # (M,)
                     src_gt = gt_idx_per_pred[pred_edge_index[0]]
                     tgt_gt = gt_idx_per_pred[pred_edge_index[1]]
                     pred_edge_labels = gt_rel_dense[src_gt, tgt_gt]  # (E, R)
 
-                    # 前向传播：用检测框 + 全连接图做关系预测
                     output = self.model(
                         images,
                         gt_boxes=boxes,
@@ -595,11 +514,9 @@ class ConstraintTrainer:
                         num_nodes=M
                     )
                 else:
-                    # 匹配失败，跳过该样本
                     loss = torch.tensor(0.0, device=self.device)
                     loss_dict = {'rel_loss': 0.0, 'exist_loss': 0.0, 'constraint_loss': 0.0}
                 
-                # 🔥 pred 模式：第二次前向计算 det_loss（需要梯度）
                 yolo_boxes = gt_boxes.clone()
                 yolo_boxes_xywh = torch.zeros_like(yolo_boxes)
                 yolo_boxes_xywh[:, 0] = (yolo_boxes[:, 0] + yolo_boxes[:, 2]) / 2
@@ -609,7 +526,6 @@ class ConstraintTrainer:
                 det_loss, _ = self.model.compute_det_loss(images, yolo_boxes_xywh, gt_classes)
                 
             else:
-                # ====== gt 模式：用 GT boxes + GT edge_index 训练关系（当前默认）======
                 output = self.model(
                     images,
                     gt_boxes=gt_boxes,
@@ -620,14 +536,12 @@ class ConstraintTrainer:
                 rel_logits = output['relation_logits']
                 exist_logits = output['exist_logits']
 
-                # 计算 Loss（包含约束）
                 loss, loss_dict = self.relation_loss(
                     rel_logits, exist_logits, gt_edge_labels,
                     edge_index=gt_edge_index,
                     num_nodes=len(gt_boxes)
                 )
                 
-                # gt 模式：计算 det_loss
                 yolo_boxes = gt_boxes.clone()
                 yolo_boxes_xywh = torch.zeros_like(yolo_boxes)
                 yolo_boxes_xywh[:, 0] = (yolo_boxes[:, 0] + yolo_boxes[:, 2]) / 2
@@ -636,7 +550,6 @@ class ConstraintTrainer:
                 yolo_boxes_xywh[:, 3] = yolo_boxes[:, 3] - yolo_boxes[:, 1]
                 det_loss, _ = self.model.compute_det_loss(images, yolo_boxes_xywh, gt_classes)
             
-            # 总 Loss（除以累积步数进行缩放）
             total = (loss + self.config['det_weight'] * det_loss) / accum_steps
             
             total.backward()
@@ -644,7 +557,6 @@ class ConstraintTrainer:
             accum_loss += total.item() * accum_steps  # 还原真实 loss 用于记录
             accum_count += 1
             
-            # 梯度累积：每 accum_steps 步更新一次
             if accum_count % accum_steps == 0 or (batch_idx + 1) == len(self.train_loader):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
@@ -663,12 +575,10 @@ class ConstraintTrainer:
                 
                 accum_loss = 0.0
         
-        # 平均
         avg_loss = total_loss / max(num_batches, 1)
         for k in loss_components:
             loss_components[k] /= max(num_batches, 1)
         
-        # 打印 pred 模式统计
         if self.config.get('rel_train_mode') == 'pred':
             print(f"\n📊 pred模式统计:")
             print(f"   总样本: {pred_mode_stats['total_samples']}")
@@ -683,15 +593,13 @@ class ConstraintTrainer:
         """验证（真正的 E2E：使用检测框做关系预测）"""
         self.model.eval()
         
-        # 使用新的评估器（支持 raw + VAS 双轨）
-        evaluator = gDSAEvaluatorNew(
+        evaluator = gDSAEvaluator(
             num_relations=self.config['num_relations'],
             iou_threshold=0.5,
             relation_thresholds=[0.5, 0.75, 0.95],
             topk_per_relation=2000
         )
         
-        # DLA 指标统计
         dla_stats = {
             'all_pred_boxes': [],
             'all_pred_scores': [],
@@ -700,7 +608,6 @@ class ConstraintTrainer:
             'all_gt_classes': []
         }
         
-        # 推理速度统计
         inference_times = []
         num_samples = 0
         
@@ -712,11 +619,9 @@ class ConstraintTrainer:
                 gt_edge_index = batch['edge_index'].squeeze(0).to(self.device)
                 gt_edge_labels = batch['edge_labels'].squeeze(0).to(self.device)
                 
-                # 计时开始
                 torch.cuda.synchronize() if self.device.type == 'cuda' else None
                 t_start = time.perf_counter()
                 
-                # E2E 评估：使用检测框（不是 GT 框）
                 if hasattr(self.model, '_detect_with_det_model'):
                     pred_boxes, pred_classes, pred_scores = self.model._detect_with_det_model(
                         images, conf_thresh=0.25
@@ -726,7 +631,6 @@ class ConstraintTrainer:
                         images, conf_thresh=0.25
                     )
                 
-                # DLA 统计
                 if len(pred_boxes) > 0 and pred_scores is not None:
                     dla_stats['all_pred_boxes'].append(pred_boxes.cpu())
                     dla_stats['all_pred_scores'].append(pred_scores.cpu())
@@ -735,23 +639,19 @@ class ConstraintTrainer:
                 dla_stats['all_gt_boxes'].append(gt_boxes.cpu())
                 dla_stats['all_gt_classes'].append(gt_classes.cpu())
                 
-                # gDSA E2E 评估需要至少 2 个 GT 框和 2 个检测框
                 if len(gt_boxes) < 2 or len(pred_boxes) < 2:
-                    # 计时结束
                     torch.cuda.synchronize() if self.device.type == 'cuda' else None
                     t_end = time.perf_counter()
                     inference_times.append(t_end - t_start)
                     num_samples += 1
                     continue
                 
-                # 构建全连接图
                 N = len(pred_boxes)
                 src = torch.arange(N, device=self.device).repeat_interleave(N)
                 tgt = torch.arange(N, device=self.device).repeat(N)
                 mask = src != tgt
                 pred_edge_index = torch.stack([src[mask], tgt[mask]], dim=0)
                 
-                # 用检测框做关系预测
                 output = self.model(
                     images,
                     gt_boxes=pred_boxes,
@@ -759,7 +659,6 @@ class ConstraintTrainer:
                     edge_index=pred_edge_index
                 )
                 
-                # 计时结束
                 torch.cuda.synchronize() if self.device.type == 'cuda' else None
                 t_end = time.perf_counter()
                 inference_times.append(t_end - t_start)
@@ -771,22 +670,18 @@ class ConstraintTrainer:
                 rel_probs = torch.sigmoid(rel_logits)
                 exist_probs = torch.sigmoid(exist_logits)
                 
-                # 构建 dense 概率矩阵 [N, N, R]（向量化版本）
                 R = self.config['num_relations']
                 pred_rel_probs_dense = torch.zeros(N, N, R, device=self.device)
-                # 向量化写入：使用 edge_index 直接索引
                 src_idx = pred_edge_index[0]  # [E]
                 tgt_idx = pred_edge_index[1]  # [E]
                 scores = rel_probs * exist_probs.unsqueeze(1)  # [E, R]
                 pred_rel_probs_dense[src_idx, tgt_idx] = scores
                 
-                # 转换为评估器需要的格式
                 pred_boxes_np = pred_boxes.cpu().numpy()
                 pred_classes_np = pred_classes.cpu().numpy()
                 gt_boxes_np = gt_boxes.cpu().numpy()
                 gt_classes_np = gt_classes.cpu().numpy()
                 
-                # GT 关系列表（向量化版本，避免 Python 双循环和 GPU 同步）
                 gt_edge_index_cpu = gt_edge_index.cpu()
                 gt_edge_labels_cpu = gt_edge_labels.cpu()
                 pos = (gt_edge_labels_cpu > 0).nonzero(as_tuple=False)  # [K, 2]，(e, r)
@@ -797,37 +692,21 @@ class ConstraintTrainer:
                 rel_gt = r_idx.numpy()
                 gt_relations = list(zip(src_gt.tolist(), tgt_gt.tolist(), rel_gt.tolist()))
                 
-                # 添加到评估器（使用 VAS）
                 evaluator.add_sample(
                     pred_boxes=pred_boxes_np,
                     pred_classes=pred_classes_np,
-                    pred_relations=[],  # 会从 dense 提取
+                    pred_relations=[],
                     pred_scores=pred_scores.cpu().numpy() if pred_scores is not None else None,
                     gt_boxes=gt_boxes_np,
                     gt_classes=gt_classes_np,
                     gt_relations=gt_relations,
-                    pred_rel_probs=pred_rel_probs_dense,
-                    use_vas=True,
-                    lam=5.0, alpha=0.5, beta=0.5, gamma=1.0
+                    pred_rel_probs=pred_rel_probs_dense
                 )
         
-        # 计算 gDSA 指标（raw + VW-mAP）
-        metrics_raw = evaluator.compute_metrics(use_vas=False)
-        
-        # 计算 VW-mAP 指标（方案 A: VW-mAP = mAP × V_eff）
-        metrics_vw = evaluator.compute_vw_metrics(mode='mul', use_vas_for_map=False)
-        
-        # 合并指标（统一键名格式）
+        metrics_raw = evaluator.compute_metrics()
         metrics = {}
-        # Raw 指标: mR_g@0.5 -> mR_g@0.5_raw
         for k, v in metrics_raw.items():
             metrics[k + '_raw'] = v
-        
-        # VW-mAP 指标
-        for k, v in metrics_vw.items():
-            metrics[k] = v
-        
-        # 为了兼容旧代码，保留 _e2e 后缀的指标（使用 raw 版本）
         metrics['mR_g@0.5_e2e'] = metrics_raw.get('mR_g@0.5', 0.0)
         metrics['mAP_g@0.5_e2e'] = metrics_raw.get('mAP_g@0.5', 0.0)
         metrics['mR_g@0.75_e2e'] = metrics_raw.get('mR_g@0.75', 0.0)
@@ -835,7 +714,6 @@ class ConstraintTrainer:
         metrics['mR_g@0.95_e2e'] = metrics_raw.get('mR_g@0.95', 0.0)
         metrics['mAP_g@0.95_e2e'] = metrics_raw.get('mAP_g@0.95', 0.0)
         
-        # 计算 DLA 指标（可选）
         if not self.config.get('skip_dla', False):
             dla_metrics = self._compute_dla_metrics(dla_stats)
             metrics.update(dla_metrics)
@@ -843,7 +721,6 @@ class ConstraintTrainer:
             metrics['mAP50'] = 0.0
             metrics['mAP50-95'] = 0.0
         
-        # 推理速度统计
         if inference_times:
             avg_time = np.mean(inference_times)
             fps = 1.0 / avg_time if avg_time > 0 else 0
@@ -867,50 +744,36 @@ class ConstraintTrainer:
         
         device = pred_boxes.device
         
-        # 计算 IoU 矩阵 [N_pred, N_gt]
         iou_matrix = self._box_iou(pred_boxes, gt_boxes)  # 保持在 GPU
         
-        # 向量化类别匹配：[N_pred, N_gt]
         class_match = (pred_classes.unsqueeze(1) == gt_classes.unsqueeze(0)).float()
         iou_matrix = iou_matrix * class_match  # 类别不匹配的位置 IoU 置零
         
-        # 对每个 pred，找到最佳 gt（向量化）
         max_ious, best_gt_indices = iou_matrix.max(dim=1)  # [N_pred]
         
-        # 过滤掉低于阈值的匹配
         valid_mask = max_ious > iou_thresh  # [N_pred]
         
         if not valid_mask.any():
             return {}
         
-        # 获取有效匹配（全程在 GPU）
         valid_pred_indices = torch.where(valid_mask)[0]  # [K]
         valid_gt_indices = best_gt_indices[valid_mask]  # [K]
         valid_ious = max_ious[valid_mask]  # [K]
         
-        # 处理多个 pred 匹配到同一个 gt 的情况（向量化）
-        # 策略：对每个 gt，保留 IoU 最大的 pred
         
-        # 创建稀疏映射：gt_idx -> (pred_idx, iou)
-        # 使用 scatter_reduce 找到每个 gt 的最大 IoU
         gt_max_ious = torch.zeros(N_gt, device=device)
         gt_max_ious.scatter_reduce_(
             0, valid_gt_indices, valid_ious, 
             reduce='amax', include_self=False
         )
         
-        # 找出每个 gt 对应的最佳 pred（IoU 最大的那个）
-        # 对于每个有效匹配，检查它是否是该 gt 的最佳匹配
         is_best_match = (valid_ious == gt_max_ious[valid_gt_indices])  # [K]
         
-        # 过滤出最佳匹配
         best_pred_indices = valid_pred_indices[is_best_match]
         best_gt_indices = valid_gt_indices[is_best_match]
         
-        # 转换为字典（只在最后做一次 CPU 转换）
         matching = {}
         if len(best_gt_indices) > 0:
-            # 一次性转换到 CPU
             gt_list = best_gt_indices.cpu().tolist()
             pred_list = best_pred_indices.cpu().tolist()
             matching = dict(zip(gt_list, pred_list))
@@ -925,7 +788,6 @@ class ConstraintTrainer:
             print(f"   ⚠️ DLA: 没有检测到任何框")
             return {'mAP50': 0.0, 'mAP50-95': 0.0}
         
-        # 调试信息
         total_pred = sum(len(b) for b in dla_stats['all_pred_boxes'])
         total_gt = sum(len(b) for b in dla_stats['all_gt_boxes'])
         print(f"   📊 DLA: 预测框={total_pred}, GT框={total_gt}, 样本数={len(dla_stats['all_pred_boxes'])}/{len(dla_stats['all_gt_boxes'])}")
@@ -933,10 +795,8 @@ class ConstraintTrainer:
         num_classes = self.config['num_classes']
         iou_thresholds = np.arange(0.5, 1.0, 0.05)  # 0.5 to 0.95
         
-        # 预先收集所有样本的数据（避免重复计算）
         num_samples = len(dla_stats['all_gt_boxes'])
         
-        # 按类别统计
         class_aps = {c: [] for c in range(num_classes)}
         
         for iou_thresh in iou_thresholds:
@@ -949,7 +809,6 @@ class ConstraintTrainer:
                     gt_boxes = dla_stats['all_gt_boxes'][i]
                     gt_classes = dla_stats['all_gt_classes'][i]
                     
-                    # GT boxes for this class
                     gt_mask = gt_classes == c
                     gt_boxes_c = gt_boxes[gt_mask]
                     num_gt += len(gt_boxes_c)
@@ -959,26 +818,21 @@ class ConstraintTrainer:
                         pred_scores = dla_stats['all_pred_scores'][i]
                         pred_classes = dla_stats['all_pred_classes'][i]
                         
-                        # Pred boxes for this class
                         pred_mask = pred_classes == c
                         pred_boxes_c = pred_boxes[pred_mask]
                         pred_scores_c = pred_scores[pred_mask]
                         
                         if len(pred_boxes_c) > 0 and len(gt_boxes_c) > 0:
-                            # 计算 IoU（已经是向量化的）
                             ious = self._box_iou(pred_boxes_c, gt_boxes_c)
                             
-                            # 向量化匹配：按分数降序处理
                             sorted_idx = torch.argsort(pred_scores_c, descending=True)
                             scores_sorted = pred_scores_c[sorted_idx].cpu().numpy()
                             ious_sorted = ious[sorted_idx].cpu().numpy()
                             
-                            # 贪心匹配
                             matched_gt = np.zeros(len(gt_boxes_c), dtype=bool)
                             tps = np.zeros(len(pred_boxes_c), dtype=int)
                             
                             for j in range(len(sorted_idx)):
-                                # 找未匹配的最大 IoU
                                 iou_row = ious_sorted[j].copy()
                                 iou_row[matched_gt] = -1  # 已匹配的设为 -1
                                 best_gt = np.argmax(iou_row)
@@ -994,26 +848,21 @@ class ConstraintTrainer:
                             all_scores.extend(pred_scores_c.cpu().numpy().tolist())
                             all_tps.extend([0] * len(pred_boxes_c))
                 
-                # 计算 AP
                 if num_gt > 0 and len(all_tps) > 0:
                     scores_arr = np.array(all_scores)
                     tps_arr = np.array(all_tps)
                     
-                    # 按分数排序
                     sorted_idx = np.argsort(-scores_arr)
                     tp_sorted = tps_arr[sorted_idx]
                     
-                    # 累积
                     tp_cumsum = np.cumsum(tp_sorted)
                     fp_cumsum = np.cumsum(1 - tp_sorted)
                     
                     recalls = tp_cumsum / num_gt
                     precisions = tp_cumsum / (tp_cumsum + fp_cumsum)
                     
-                    # 插值 AP（向量化）
                     precisions_interp = np.maximum.accumulate(precisions[::-1])[::-1]
                     
-                    # 计算 AP
                     recall_diff = np.diff(np.concatenate([[0], recalls]))
                     ap = np.sum(recall_diff * precisions_interp)
                     
@@ -1021,7 +870,6 @@ class ConstraintTrainer:
                 else:
                     class_aps[c].append(0.0)
         
-        # 计算 mAP
         ap50_list = []
         ap50_95_list = []
         
@@ -1037,17 +885,14 @@ class ConstraintTrainer:
     
     def _box_iou(self, boxes1, boxes2):
         """计算两组框的 IoU"""
-        # boxes: [N, 4] in xyxy format
         area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
         area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
         
-        # 交集
         lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
         rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
         wh = (rb - lt).clamp(min=0)
         inter = wh[:, :, 0] * wh[:, :, 1]
         
-        # IoU
         iou = inter / (area1[:, None] + area2[None, :] - inter + 1e-6)
         return iou
     
@@ -1057,7 +902,6 @@ class ConstraintTrainer:
         print(f"开始训练 (约束权重: {self.config['constraint_weight']})")
         print(f"{'='*60}\n")
         
-        # 记录训练开始时间
         self.train_start_time = datetime.now()
         self.history['train_start_time'] = self.train_start_time.strftime('%Y-%m-%d %H:%M:%S')
         
@@ -1065,18 +909,15 @@ class ConstraintTrainer:
             self.current_epoch = epoch
             epoch_start_time = time.time()
             
-            # 训练
             train_loss, loss_components = self.train_epoch(epoch)
             self.history['train_loss'].append(train_loss)
             for k, v in loss_components.items():
                 self.history[f'train_{k}'].append(v)
             
-            # 记录 epoch 训练时间
             epoch_train_time = time.time() - epoch_start_time
             self.history['epoch_train_time'].append(epoch_train_time)
             self.total_train_time += epoch_train_time
             
-            # 验证（按间隔执行）
             val_interval = self.config.get('val_interval', 1)
             if epoch % val_interval == 0 or epoch == self.config['epochs']:
                 val_start_time = time.time()
@@ -1087,65 +928,51 @@ class ConstraintTrainer:
                 for k, v in metrics.items():
                     self.history[k].append(v)
                 
-                # 打印验证指标
                 print(f"\nEpoch {epoch}/{self.config['epochs']} (训练: {epoch_train_time:.1f}s, 验证: {val_time:.1f}s)")
                 print(f"  Train Loss: {train_loss:.4f}")
                 print(f"  Constraint Loss: {loss_components.get('constraint_loss', 0):.4f}")
                 print(f"  DLA: mAP50-95={metrics.get('mAP50-95', 0):.4f}")
-                print(f"  gDSA (Raw):    mR_g@0.5={metrics.get('mR_g@0.5_raw', 0):.4f}  mAP_g@0.5={metrics.get('mAP_g@0.5_raw', 0):.4f}  mAP_g@0.75={metrics.get('mAP_g@0.75_raw', 0):.4f}  mAP_g@0.95={metrics.get('mAP_g@0.95_raw', 0):.4f}")
-                # Always print mAP_norm if available
-                print(f"  gDSA (Norm):   mAP_norm@0.5={metrics.get('mAP_norm@0.5_raw', 0):.4f}  mAP_norm@0.75={metrics.get('mAP_norm@0.75_raw', 0):.4f}  mAP_norm@0.95={metrics.get('mAP_norm@0.95_raw', 0):.4f}")
-                print(f"  Validity:      V@0.5={metrics.get('V@0.5', 0):.4f}  C_E={metrics.get('C_E@0.5', 0):.4f}  V_eff={metrics.get('V_eff@0.5', 0):.4f}  (V_tree={metrics.get('V_tree@0.5', 0):.4f})")
-                print(f"  VW-mAP:        VW-mAP@0.5={metrics.get('VW-mAP_g@0.5', 0):.4f}  VW-mAP@0.75={metrics.get('VW-mAP_g@0.75', 0):.4f}  VW-mAP@0.95={metrics.get('VW-mAP_g@0.95', 0):.4f}")
+                print(f"  gDSA:          mR_g@0.5={metrics.get('mR_g@0.5_raw', 0):.4f}  mAP_g@0.5={metrics.get('mAP_g@0.5_raw', 0):.4f}  mAP_g@0.75={metrics.get('mAP_g@0.75_raw', 0):.4f}  mAP_g@0.95={metrics.get('mAP_g@0.95_raw', 0):.4f}")
                 
-                # 保存最佳模型 - mAP_g@0.5
                 current_map_05 = metrics['mAP_g@0.5_e2e']
                 if current_map_05 > self.best_metrics_05.get('mAP_g@0.5_e2e', 0):
                     self.best_metrics_05 = metrics.copy()
                     self.save_checkpoint('best_mAP_g_05.pth')
                     print(f"  ✅ 新最佳 mAP_g@0.5: {current_map_05:.4f}")
                 
-                # 保存最佳模型 - mAP_g@0.75
                 current_map_075 = metrics['mAP_g@0.75_e2e']
                 if current_map_075 > self.best_metrics_075.get('mAP_g@0.75_e2e', 0):
                     self.best_metrics_075 = metrics.copy()
                     self.save_checkpoint('best_mAP_g_075.pth')
                     print(f"  ✅ 新最佳 mAP_g@0.75: {current_map_075:.4f}")
                 
-                # 保存最佳模型 - mAP_g@0.95
                 current_map_095 = metrics['mAP_g@0.95_e2e']
                 if current_map_095 > self.best_metrics_095.get('mAP_g@0.95_e2e', 0):
                     self.best_metrics_095 = metrics.copy()
                     self.save_checkpoint('best_mAP_g_095.pth')
                     print(f"  ✅ 新最佳 mAP_g@0.95: {current_map_095:.4f}")
                 
-                # 更新综合最佳（用于兼容）
                 if current_map_05 > self.best_metrics.get('mAP_g@0.5_e2e', 0):
                     self.best_metrics = metrics.copy()
                 
-                # 早停检查（监控三个 mAP 指标，任何一个提升都重置计数器）
                 if self.early_stop_patience > 0:
                     has_improvement = False
                     
-                    # 检查 mAP_g@0.5
                     if current_map_05 > self.best_early_stop_metrics['mAP_g@0.5']:
                         self.best_early_stop_metrics['mAP_g@0.5'] = current_map_05
                         has_improvement = True
                         print(f"  📈 mAP_g@0.5 提升: {current_map_05:.4f}")
                     
-                    # 检查 mAP_g@0.75
                     if current_map_075 > self.best_early_stop_metrics['mAP_g@0.75']:
                         self.best_early_stop_metrics['mAP_g@0.75'] = current_map_075
                         has_improvement = True
                         print(f"  📈 mAP_g@0.75 提升: {current_map_075:.4f}")
                     
-                    # 检查 mAP_g@0.95
                     if current_map_095 > self.best_early_stop_metrics['mAP_g@0.95']:
                         self.best_early_stop_metrics['mAP_g@0.95'] = current_map_095
                         has_improvement = True
                         print(f"  📈 mAP_g@0.95 提升: {current_map_095:.4f}")
                     
-                    # 更新早停计数器
                     if has_improvement:
                         self.early_stop_counter = 0
                     else:
@@ -1160,23 +987,18 @@ class ConstraintTrainer:
                             print(f"  mAP_g@0.95: {self.best_early_stop_metrics['mAP_g@0.95']:.4f}")
                             break
             else:
-                # 不验证时只打印训练 loss
                 print(f"\nEpoch {epoch}/{self.config['epochs']} (训练: {epoch_train_time:.1f}s)")
                 print(f"  Train Loss: {train_loss:.4f}")
                 print(f"  Constraint Loss: {loss_components.get('constraint_loss', 0):.4f}")
             
-            # 学习率调度
             self.scheduler.step()
             
-            # 定期保存
             if epoch % 10 == 0:
                 self.save_checkpoint(f'epoch_{epoch}.pth')
             
-            # 更新总训练时间并保存
             self.history['total_train_time_hours'] = self.total_train_time / 3600
             self.save_history()
         
-        # 训练结束
         train_end_time = datetime.now()
         total_time = (train_end_time - self.train_start_time).total_seconds()
         self.history['train_end_time'] = train_end_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -1212,14 +1034,11 @@ class ConstraintTrainer:
         """保存训练历史到 JSON 文件"""
         path = os.path.join(self.config['save_dir'], 'training_history.json')
         
-        # 确保目录存在
         os.makedirs(self.config['save_dir'], exist_ok=True)
         
-        # 转换 defaultdict 为普通 dict
         history_dict = {}
         for key, value in self.history.items():
             if isinstance(value, list):
-                # 确保列表中的值可以序列化
                 history_dict[key] = [float(v) if isinstance(v, (int, float, np.number)) else v for v in value]
             else:
                 history_dict[key] = value
@@ -1227,14 +1046,12 @@ class ConstraintTrainer:
         try:
             with open(path, 'w') as f:
                 json.dump(history_dict, f, indent=2)
-            # print(f"✅ 训练历史已保存: {path}")  # 可选：调试信息
         except Exception as e:
             print(f"⚠️ 保存训练历史失败: {e}")
             print(f"   路径: {path}")
             print(f"   历史数据键: {list(history_dict.keys())}")
 
 
-# ============ 主函数 ============
 
 def main():
     parser = argparse.ArgumentParser(description='带约束 Loss 的 gDSA 训练')
@@ -1272,13 +1089,11 @@ def main():
                         help='不使用边几何特征（对照实验：只用节点特征）')
     args = parser.parse_args()
     
-    # 处理 backbone 参数
     if args.backbone:
         yolo_path = BACKBONE_MAP.get(args.backbone, args.yolo)
     else:
         yolo_path = args.yolo
     
-    # 自动生成保存目录名
     if args.save_dir is None:
         backbone_name = args.backbone or 'yolo11n'
         edge_suffix = '_noedge' if args.no_edge_features else ''
@@ -1286,9 +1101,7 @@ def main():
     else:
         save_dir = args.save_dir
     
-    # 配置
     config = {
-        # 数据
         'train_img_dir': './dataset_gdsa/images/train',
         'train_yolo_dir': './dataset_gdsa/labels/train',
         'val_img_dir': './dataset_gdsa/images/val',
@@ -1300,7 +1113,6 @@ def main():
         'use_original_size': args.use_original_size,
         'max_size': args.max_size,
         
-        # 模型
         'yolo_model_path': yolo_path,
         'model_type': 'transformer',
         'num_classes': 8,
@@ -1312,7 +1124,6 @@ def main():
         'num_heads': 8,
         'dropout': 0.1,
         
-        # 训练
         'epochs': args.epochs,
         'lr': args.lr,
         'weight_decay': 1e-4,
@@ -1326,7 +1137,6 @@ def main():
         'rel_train_mode': args.rel_train_mode,
         'use_edge_features': not args.no_edge_features,  # 是否使用边特征
         
-        # 保存
         'save_dir': save_dir,
     }
     
@@ -1348,7 +1158,6 @@ def main():
     
     trainer = ConstraintTrainer(config)
     
-    # 信号处理
     def signal_handler(sig, frame):
         print("\n⚠️ 收到中断信号，保存中...")
         trainer.save_history()
@@ -1363,3 +1172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
